@@ -2,6 +2,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
 const path = require('path');
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -9,37 +10,33 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 let newCoins = [];
 let clients = [];
+let lastIds = new Set();
 
-function connectPumpFun() {
-  console.log('🔌 جاري الاتصال بـ pump.fun...');
-  const ws = new WebSocket('wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket');
-
-  ws.on('open', () => {
-    console.log('✅ متصل بـ pump.fun');
-    ws.send('40');
-  });
-
-  ws.on('message', (data) => {
-    const msg = data.toString();
-    if (msg === '2') { ws.send('3'); return; }
-    if (msg.startsWith('40')) {
-      ws.send('42["subscribe",{"action":"newCoin"}]');
-      return;
-    }
-    if (msg.startsWith('42')) {
+function fetchNewCoins() {
+  const options = {
+    hostname: 'frontend-api.pump.fun',
+    path: '/coins?offset=0&limit=20&sort=created_timestamp&order=DESC&includeNsfw=false',
+    method: 'GET',
+    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+  };
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
       try {
-        const json = JSON.parse(msg.slice(2));
-        if (json[0] === 'newCoin') processCoin(json[1]);
-      } catch(e) {}
-    }
+        const coins = JSON.parse(data);
+        if (!Array.isArray(coins)) return;
+        coins.forEach(coin => {
+          if (lastIds.has(coin.mint)) return;
+          lastIds.add(coin.mint);
+          if (lastIds.size > 500) lastIds = new Set([...lastIds].slice(-200));
+          processCoin(coin);
+        });
+      } catch(e) { console.log('خطأ:', e.message); }
+    });
   });
-
-  ws.on('close', () => {
-    console.log('❌ انقطع، إعادة المحاولة...');
-    setTimeout(connectPumpFun, 3000);
-  });
-
-  ws.on('error', (e) => console.log('خطأ:', e.message));
+  req.on('error', e => console.log('خطأ:', e.message));
+  req.end();
 }
 
 function processCoin(coin) {
@@ -51,9 +48,9 @@ function processCoin(coin) {
     image: coin.image_uri || '',
     description: coin.description || '',
     marketCap: coin.usd_market_cap || 0,
-    createdAt: Date.now(),
-    pumpLink: `https://pump.fun/${coin.mint}`,
-    dexLink: `https://dexscreener.com/solana/${coin.mint}`,
+    createdAt: coin.created_timestamp || Date.now(),
+    pumpLink: 'https://pump.fun/' + coin.mint,
+    dexLink: 'https://dexscreener.com/solana/' + coin.mint,
     score: calcScore(coin),
     twitter: coin.twitter || '',
     telegram: coin.telegram || '',
@@ -61,7 +58,7 @@ function processCoin(coin) {
   };
   newCoins.unshift(c);
   if (newCoins.length > 100) newCoins = newCoins.slice(0, 100);
-  console.log(`🚀 ${c.name} (${c.symbol}) - score:${c.score}`);
+  console.log('🚀 ' + c.name + ' (' + c.symbol + ') score:' + c.score);
   broadcast({ type: 'newCoin', coin: c });
 }
 
@@ -85,7 +82,7 @@ app.get('/api/coins', (req, res) => res.json(newCoins));
 app.get('/api/status', (req, res) => res.json({ ok: true, count: newCoins.length }));
 
 const server = app.listen(process.env.PORT || 3000, () => {
-  console.log(`🌐 يعمل على المنفذ ${process.env.PORT || 3000}`);
+  console.log('🌐 يعمل على المنفذ ' + (process.env.PORT || 3000));
 });
 
 const wss = new WebSocket.Server({ server, path: '/ws' });
@@ -95,4 +92,6 @@ wss.on('connection', (ws) => {
   ws.on('close', () => { clients = clients.filter(c => c !== ws); });
 });
 
-connectPumpFun();
+console.log('🔄 بدء جلب العملات كل 10 ثواني...');
+fetchNewCoins();
+setInterval(fetchNewCoins, 10000);
